@@ -1,8 +1,10 @@
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from fastapi.responses import StreamingResponse, PlainTextResponse
+from pydantic import BaseModel, Field
 import ollama
+from ollama import web_fetch, web_search
 import logging
+import datetime
 from typing import Literal
 
 # Configure logging
@@ -26,14 +28,16 @@ class HousePurchaseRequest(BaseModel):
     income: float
     total_monthly_debt: float
     total_liquid_assets: float
-    zip_code: str
+    zip_code: str = Field(pattern=r"^\d{5}$")
     credit_score: int
     user_input: str = ""
-    model: Literal["gemma3:27b"] = "gemma3:27b"
+    model: Literal["gpt-oss:20b"] = "gpt-oss:20b"
     
 
 async def generate_ollama_stream(messages: list, model: str):
     """Generator function to stream response chunks from Ollama."""
+    
+    # Streaming was working well for this use case
     stream = ollama.chat(
         model=model,
         messages=messages,
@@ -41,22 +45,58 @@ async def generate_ollama_stream(messages: list, model: str):
     )
     for chunk in stream:
         # Yield each content chunk as a string
-        yield chunk['message']['content']
+        yield chunk.message.content
 
 
-@app.post("/plan-home-purchase")
+def get_ollama_response_with_web(messages: list, model: str):
+    """Use Ollama to generate responses using the web when appropriate."""
+    available_tools = {'web_search': web_search, 'web_fetch': web_fetch}
+
+    while True:
+        response = ollama.chat(
+            model=model,
+            messages=messages,
+            think=True,
+            tools=[ollama.web_search, ollama.web_fetch]
+        )
+        if response.message.thinking:
+            logger.info('Thinking: ', response.message.thinking)
+        if response.message.content:
+            logger.info('Content: ', response.message.content)
+        messages.append(response.message)
+        if response.message.tool_calls:
+            logger.info('Tool calls: ', response.message.tool_calls)
+            for tool_call in response.message.tool_calls:
+                function_to_call = available_tools.get(tool_call.function.name)
+            if function_to_call:
+                args = tool_call.function.arguments
+                result = function_to_call(**args)
+                logger.info('Result: ', str(result)[:200]+'...')
+                # Result is truncated for limited context lengths
+                messages.append({'role': 'tool', 'content': str(result)[:8000 * 4], 'tool_name': tool_call.function.name})
+            else:
+                messages.append({'role': 'tool', 'content': f'Tool {tool_call.function.name} not found', 'tool_name': tool_call.function.name})
+        else:
+            break
+            
+    return messages[-1].content
+
+
+@app.post("/plan-home-purchase", response_class=PlainTextResponse)
 def generate_house_purchase_plan(request: HousePurchaseRequest):
     try:
         prompt = f"""
         You are a financial assistant specializing in home purchases. Provide a detailed assessment of whether a potential home buyer can afford a home, and offer personalized recommendations.
+        Please note that the current date is ${datetime.datetime.now().isoformat()}.
+        You will also have access to the Internet, please use this to find relevant data like costs of living and housing trends in the zip code. As well as up to date interest rates.
 
         Here are the buyer's details:
-        - Income: ${request.income} per year
-        - Total Monthly Debt: ${request.total_monthly_debt}
-        - Total Liquid Assets: ${request.total_liquid_assets}
+        - Income: {request.income} per year
+        - Total Monthly Debt: {request.total_monthly_debt}
+        - Total Liquid Assets: {request.total_liquid_assets}
         - Zip Code: {request.zip_code} (for local property tax estimation)
-        - Credit Score: ${request.credit_score} (for interest rate, in addition to current trends)
-        - User input: ${request.user_input} (if applicable)
+        - Credit Score: {request.credit_score} (for interest rate, in addition to current trends)
+        - User input: {request.user_input} (if applicable)
 
         Based on this information, please provide the following:
 
@@ -76,16 +116,13 @@ def generate_house_purchase_plan(request: HousePurchaseRequest):
             {
                 'role': 'user',
                 'content': prompt,
-            },
+            }
         ]
 
-        return StreamingResponse(
-            generate_ollama_stream(messages, request.model),
-            media_type="text/plain"
-        )
+        return get_ollama_response_with_web(messages, request.model)
 
     except Exception as e:
-        logger.exception()
+        logger.exception("Exception processing:")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -127,7 +164,7 @@ def generate_house_purchase_plan(request: RetirementRequest):
         )
 
     except Exception as e:
-        logger.exception()
+        logger.exception("Exception processing:")
         raise HTTPException(status_code=500, detail=str(e))
 
 
